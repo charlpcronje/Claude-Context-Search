@@ -1,0 +1,39 @@
+{
+  "name": "claude-contexts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local web UI to browse and search Claude Code conversation history (~/.claude/projects).",
+  "bin": {
+    "ccs": "bin/ccs.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "ccs": "node bin/ccs.js",
+    "reindex": "node indexer.js --full",
+    "build": "pkg . --compress GZip --output dist/ccs.exe",
+    "install:ccs": "npm run build && node -e \"require('fs').copyFileSync('dist/ccs.exe','c:/dev/scripts/ccs.exe'); console.log('installed to c:/dev/scripts/ccs.exe')\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^6.14.2"
+  },
+  "pkg": {
+    "scripts": [
+      "server.js",
+      "indexer.js"
+    ],
+    "assets": [
+      "public/**/*",
+      "node_modules/better-sqlite3/build/Release/*.node"
+    ],
+    "targets": [
+      "node20-win-x64"
+    ]
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

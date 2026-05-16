@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# stale local index (replaced by ~/.claude-contexts/index.db)
+data/
+
+# pkg cache and per-machine stuff
+.pkg-cache/
+.vscode/
+.idea/
+
+# logs
+*.log
+npm-debug.log*
+
+# env
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# temp
+tmp/
+*.tmp

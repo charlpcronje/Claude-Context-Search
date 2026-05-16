@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Claude Contexts</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">claude contexts</span>
+      <span id="stat-pill" class="pill" title="index status">…</span>
+    </div>
+
+    <div class="search-wrap">
+      <div class="search-row">
+        <input id="search-input" type="text" placeholder="type a tag and press Enter (e.g. websocket  refund  migration)" autocomplete="off" spellcheck="false">
+        <div class="match-toggle" id="match-toggle" title="match all / any">
+          <button data-mode="all" class="active">ALL</button>
+          <button data-mode="any">ANY</button>
+        </div>
+      </div>
+      <div id="chips" class="chips"></div>
+
+      <div class="filters">
+        <label class="filter">
+          <span>from</span>
+          <input type="date" id="from-date">
+        </label>
+        <label class="filter">
+          <span>to</span>
+          <input type="date" id="to-date">
+        </label>
+        <label class="filter check">
+          <input type="checkbox" id="inc-backups">
+          <span>include backups</span>
+        </label>
+        <label class="filter check">
+          <input type="checkbox" id="inc-subagents">
+          <span>include subagents</span>
+        </label>
+        <label class="filter check">
+          <input type="checkbox" id="only-user">
+          <span>only user messages</span>
+        </label>
+        <button id="clear-btn" class="ghost" title="clear all filters">clear</button>
+        <button id="reindex-btn" class="ghost" title="rescan ~/.claude/projects">reindex</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span>projects</span>
+        <span id="proj-count" class="dim"></span>
+      </div>
+      <input id="proj-filter" class="proj-filter" placeholder="filter projects…">
+      <div id="projects" class="projects-list"></div>
+    </aside>
+
+    <section class="results-pane">
+      <div class="results-head">
+        <span id="results-meta" class="dim">type tags above to search</span>
+      </div>
+      <div id="results" class="results"></div>
+    </section>
+  </main>
+
+  <div id="viewer" class="viewer hidden" aria-hidden="true">
+    <div class="viewer-backdrop" data-close></div>
+    <div class="viewer-panel">
+      <div class="viewer-head">
+        <div id="viewer-title"></div>
+        <div class="viewer-actions">
+          <button id="copy-path" class="ghost" title="copy file path">copy path</button>
+          <button data-close class="ghost">close</button>
+        </div>
+      </div>
+      <div id="viewer-body" class="viewer-body"></div>
+    </div>
+  </div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
