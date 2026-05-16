@@ -6,8 +6,10 @@ const os = require("os");
 const express = require("express");
 const Database = require("better-sqlite3");
 const readline = require("readline");
+const { spawn } = require("child_process");
 
-const { runIndex, getDbPath, PROJECTS_DIR } = require("./indexer");
+const { runIndex, getDbPath, getDataDir, initSchema, PROJECTS_DIR } = require("./indexer");
+const crypto = require("crypto");
 
 const DEFAULT_PORT = parseInt(process.env.PORT || "5179", 10);
 
@@ -398,6 +400,332 @@ function buildApp(db) {
 
   app.get("/api/health", (req, res) => res.json({ ok: true }));
 
+  /* ---- Edit / backup helpers ---- */
+
+  function sha1(s) { return crypto.createHash("sha1").update(s).digest("hex"); }
+  function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
+
+  function backupRoot() { return path.join(getDataDir(), "backups"); }
+  function sessionBackupDir(sessionId) { return path.join(backupRoot(), sessionId); }
+  function fileBackupDir(sessionId) { return path.join(backupRoot(), "files", sessionId); }
+  function externalDir(sessionId) { return path.join(backupRoot(), "external", sessionId); }
+
+  function blockToText(block) {
+    if (block == null) return "";
+    if (typeof block === "string") return block;
+    if (block.type === "text" && typeof block.text === "string") return block.text;
+    if (block.type === "thinking" && typeof block.thinking === "string") return block.thinking;
+    if (block.type === "tool_result") {
+      const c = block.content;
+      if (typeof c === "string") return c;
+      if (Array.isArray(c)) return c.map((x) => (typeof x === "string" ? x : x.text || JSON.stringify(x))).join("\n");
+    }
+    try { return JSON.stringify(block, null, 2); } catch { return String(block); }
+  }
+
+  function blockToFullJson(block) {
+    try { return JSON.stringify(block, null, 2); } catch { return String(block); }
+  }
+
+  function applyAction(block, action) {
+    if (block == null) return block;
+    if (typeof block === "string") {
+      if (action.action === "blank" || action.action === "delete") return "";
+      if (action.action === "edit") return String(action.new_text ?? "");
+      return block;
+    }
+    const out = JSON.parse(JSON.stringify(block));
+    switch (action.action) {
+      case "blank":
+        if (out.type === "text") out.text = "";
+        else if (out.type === "thinking") out.thinking = "";
+        else if (out.type === "tool_use") out.input = {};
+        else if (out.type === "tool_result") out.content = "";
+        break;
+      case "edit":
+        if (out.type === "text") out.text = String(action.new_text ?? "");
+        else if (out.type === "thinking") out.thinking = String(action.new_text ?? "");
+        else if (out.type === "tool_result") out.content = String(action.new_text ?? "");
+        else if (out.type === "tool_use") {
+          try { out.input = JSON.parse(action.new_text || "{}"); }
+          catch { out.input = { _raw: String(action.new_text ?? "") }; }
+        }
+        break;
+      case "external":
+        // Caller writes the external file and passes the marker text via new_text
+        if (out.type === "text") out.text = String(action.new_text ?? "");
+        else if (out.type === "thinking") out.thinking = String(action.new_text ?? "");
+        else if (out.type === "tool_result") out.content = String(action.new_text ?? "");
+        else if (out.type === "tool_use") out.input = { _summary: String(action.new_text ?? "") };
+        break;
+    }
+    return out;
+  }
+
+  /* ---- Block-level backup listing ---- */
+
+  app.get("/api/session/:pk/backups", (req, res) => {
+    const pk = parseInt(req.params.pk, 10);
+    const rows = db
+      .prepare(
+        `SELECT id, msg_uuid, block_index, content_hash, file_path, action, block_type, bytes, created_at, deleted
+         FROM block_backups WHERE session_pk = ? ORDER BY created_at DESC`
+      )
+      .all(pk);
+    const fileRows = db
+      .prepare(
+        `SELECT id, file_path, backup_path, bytes, created_at, note
+         FROM file_backups WHERE session_pk = ? ORDER BY created_at DESC`
+      )
+      .all(pk);
+    res.json({ block_backups: rows, file_backups: fileRows });
+  });
+
+  app.get("/api/backup/:id/content", (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const row = db.prepare("SELECT file_path, block_type FROM block_backups WHERE id = ?").get(id);
+    if (!row) return res.status(404).json({ error: "not found" });
+    try {
+      const buf = fs.readFileSync(row.file_path, "utf8");
+      res.json({ content: buf, block_type: row.block_type });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/backup/:id", (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const r = db.prepare("UPDATE block_backups SET deleted = 1 WHERE id = ?").run(id);
+    res.json({ ok: true, soft_deleted: r.changes });
+  });
+
+  /* ---- Save: apply changes to a session, with per-block + file-level backups ---- */
+
+  app.post("/api/session/:pk/save", async (req, res) => {
+    const pk = parseInt(req.params.pk, 10);
+    const changes = req.body?.changes;
+    if (!Array.isArray(changes) || !changes.length) {
+      return res.status(400).json({ error: "changes array required" });
+    }
+    const sess = db.prepare("SELECT id, session_id, file_path FROM sessions WHERE id = ?").get(pk);
+    if (!sess) return res.status(404).json({ error: "session not found" });
+    if (!fs.existsSync(sess.file_path)) return res.status(410).json({ error: "file missing" });
+
+    // Index changes by msg_uuid for fast lookup
+    const byUuid = new Map();
+    for (const c of changes) {
+      if (!c.msg_uuid || !Array.isArray(c.blocks)) continue;
+      byUuid.set(c.msg_uuid, c.blocks);
+    }
+
+    // 1. File-level backup BEFORE any modification
+    ensureDir(fileBackupDir(sess.session_id));
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileBackup = path.join(fileBackupDir(sess.session_id), `${stamp}.jsonl`);
+    try {
+      fs.copyFileSync(sess.file_path, fileBackup);
+    } catch (e) {
+      return res.status(500).json({ error: "file backup failed: " + e.message });
+    }
+    const stat = fs.statSync(fileBackup);
+    db.prepare(
+      `INSERT INTO file_backups (session_pk, file_path, backup_path, bytes, created_at, note)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(pk, sess.file_path, fileBackup, stat.size, new Date().toISOString(), req.body?.note || null);
+
+    // 2. Walk lines, apply edits, save block backups, build new file
+    const lines = fs.readFileSync(sess.file_path, "utf8").split(/\r?\n/);
+    const out = [];
+    let appliedCount = 0;
+    const blockBackups = [];
+
+    ensureDir(sessionBackupDir(sess.session_id));
+    ensureDir(externalDir(sess.session_id));
+
+    const insertBlockBackup = db.prepare(
+      `INSERT INTO block_backups (session_pk, msg_uuid, block_index, content_hash, file_path, action, block_type, bytes, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) { out.push(line); continue; }
+      let obj;
+      try { obj = JSON.parse(line); } catch { out.push(line); continue; }
+
+      const blockChanges = byUuid.get(obj.uuid);
+      if (!blockChanges || !obj.message) {
+        out.push(line);
+        continue;
+      }
+
+      let content = obj.message.content;
+      const isString = typeof content === "string";
+
+      // Sort changes: deletes last (so indices for other actions stay valid)
+      const sorted = [...blockChanges].sort((a, b) => {
+        const da = a.action === "delete" ? 1 : 0;
+        const db_ = b.action === "delete" ? 1 : 0;
+        if (da !== db_) return da - db_;
+        return (a.index || 0) - (b.index || 0);
+      });
+
+      // Apply non-delete actions first
+      for (const ch of sorted) {
+        if (ch.action === "delete") continue;
+        const idx = ch.index || 0;
+        let originalBlock;
+        if (isString) {
+          if (idx !== 0) continue;
+          originalBlock = content;
+        } else if (Array.isArray(content)) {
+          originalBlock = content[idx];
+          if (originalBlock === undefined) continue;
+        } else continue;
+
+        const text = blockToText(originalBlock);
+        const json = blockToFullJson(originalBlock);
+        const hash = sha1(json);
+        const backupFile = path.join(sessionBackupDir(sess.session_id), `${hash}.md`);
+
+        // Write backup file (idempotent — same hash = same content = same file)
+        if (!fs.existsSync(backupFile)) {
+          const meta = [
+            `<!-- ccs:backup`,
+            `   session_id: ${sess.session_id}`,
+            `   msg_uuid:   ${obj.uuid}`,
+            `   block:      ${idx}`,
+            `   type:       ${typeof originalBlock === "string" ? "string" : originalBlock?.type || "?"}`,
+            `   action:     ${ch.action}`,
+            `   created:    ${new Date().toISOString()}`,
+            `-->`,
+            ``,
+            text,
+          ].join("\n");
+          fs.writeFileSync(backupFile, meta, "utf8");
+        }
+
+        const info = insertBlockBackup.run(
+          pk, obj.uuid, idx, hash, backupFile, ch.action,
+          typeof originalBlock === "string" ? "string" : originalBlock?.type || null,
+          Buffer.byteLength(text, "utf8"),
+          new Date().toISOString()
+        );
+        blockBackups.push({ id: info.lastInsertRowid, msg_uuid: obj.uuid, block_index: idx, hash, action: ch.action });
+
+        // Handle "external" specially: write the full content out, build a marker
+        if (ch.action === "external") {
+          const summaryHead = Math.max(0, parseInt(ch.summary_head ?? 300, 10));
+          const summaryTail = Math.max(0, parseInt(ch.summary_tail ?? 300, 10));
+          const extFile = path.join(externalDir(sess.session_id), `${hash}.md`);
+          if (!fs.existsSync(extFile)) fs.writeFileSync(extFile, text, "utf8");
+          const head = text.slice(0, summaryHead);
+          const tail = text.length > summaryHead + summaryTail ? text.slice(-summaryTail) : "";
+          const marker = `${head}\n\n--- Full context available at: ${extFile} ---\n\n${tail}`;
+          ch.new_text = marker;
+        }
+
+        // Apply the modification
+        const newBlock = applyAction(originalBlock, ch);
+        if (isString) {
+          content = newBlock;
+        } else {
+          content[idx] = newBlock;
+        }
+      }
+
+      // Apply deletes (highest index first to keep lower indices valid)
+      const deletes = sorted.filter((c) => c.action === "delete").sort((a, b) => (b.index || 0) - (a.index || 0));
+      if (deletes.length && Array.isArray(content)) {
+        for (const ch of deletes) {
+          const idx = ch.index || 0;
+          const originalBlock = content[idx];
+          if (originalBlock === undefined) continue;
+          const text = blockToText(originalBlock);
+          const json = blockToFullJson(originalBlock);
+          const hash = sha1(json);
+          const backupFile = path.join(sessionBackupDir(sess.session_id), `${hash}.md`);
+          if (!fs.existsSync(backupFile)) {
+            fs.writeFileSync(backupFile, `<!-- deleted block backup -->\n\n${text}`, "utf8");
+          }
+          const info = insertBlockBackup.run(
+            pk, obj.uuid, idx, hash, backupFile, "delete",
+            originalBlock?.type || null,
+            Buffer.byteLength(text, "utf8"),
+            new Date().toISOString()
+          );
+          blockBackups.push({ id: info.lastInsertRowid, msg_uuid: obj.uuid, block_index: idx, hash, action: "delete" });
+          content.splice(idx, 1);
+        }
+      }
+
+      obj.message.content = content;
+      appliedCount++;
+      out.push(JSON.stringify(obj));
+    }
+
+    if (!appliedCount) {
+      return res.status(400).json({ error: "no matching messages for the given changes", file_backup: fileBackup });
+    }
+
+    // 3. Write the new file
+    const tmp = sess.file_path + ".tmp_save";
+    fs.writeFileSync(tmp, out.join("\n"), "utf8");
+    fs.renameSync(tmp, sess.file_path);
+
+    // 4. Mark file as needing re-index (mtime is now newer; indexer will pick it up
+    //    naturally on the next run). Re-index this single file now in-process so FTS
+    //    snippets reflect the edit.
+    try {
+      const { runIndex } = require("./indexer");
+      // We don't want to run the full walk; just bump mtime so a future full
+      // reindex catches it. Simplest: set file_mtime to 0 in db so next pass updates.
+      db.prepare("UPDATE sessions SET file_mtime = 0 WHERE id = ?").run(pk);
+    } catch {}
+
+    res.json({
+      ok: true,
+      messages_changed: appliedCount,
+      block_backups: blockBackups,
+      file_backup: fileBackup,
+    });
+  });
+
+  /* ---- Run Claude in a new terminal window pointed at a session's cwd ---- */
+  app.post("/api/run-claude", (req, res) => {
+    const sessionPk = parseInt(req.body?.session_pk || "0", 10);
+    if (!sessionPk) return res.status(400).json({ error: "session_pk required" });
+
+    const sess = db.prepare("SELECT session_id, cwd FROM sessions WHERE id = ?").get(sessionPk);
+    if (!sess) return res.status(404).json({ error: "session not found" });
+
+    const sessionId = String(sess.session_id || "");
+    const cwd = String(sess.cwd || "");
+    if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
+      return res.status(400).json({ error: "session_id invalid (refusing to spawn)" });
+    }
+    if (!cwd || !fs.existsSync(cwd)) {
+      return res.status(400).json({ error: "cwd missing or not on disk", cwd });
+    }
+
+    // Build:  start "" cmd /k cd /d "<cwd>" ^&^& clauded --resume <hash>
+    // Using start with an empty title so the new window detaches cleanly.
+    const cmdLine =
+      `start "" cmd /k cd /d "${cwd.replace(/"/g, '""')}" ^&^& clauded --resume ${sessionId}`;
+
+    try {
+      const child = spawn("cmd.exe", ["/c", cmdLine], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: false,
+      });
+      child.unref();
+      res.json({ ok: true, cwd, session_id: sessionId, cmd: `clauded --resume ${sessionId}` });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   return app;
 }
 
@@ -434,6 +762,7 @@ function _open(resolve, reject, dbPath, port) {
     db.pragma("journal_mode = WAL");
     db.pragma("synchronous = NORMAL");
     db.pragma("cache_size = -64000");
+    initSchema(db); // idempotent — picks up any new tables added since the db was created
 
     const app = buildApp(db);
 

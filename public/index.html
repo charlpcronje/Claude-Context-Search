@@ -75,6 +75,10 @@
       <div class="viewer-head">
         <div id="viewer-title"></div>
         <div class="viewer-actions">
+          <button id="edit-toggle" class="ghost" title="enable edit mode (blank / edit / external / delete blocks)">✎ edit</button>
+          <button id="save-edits" class="accent" title="save edits (creates backups first)" style="display:none">save</button>
+          <button id="cancel-edits" class="ghost" title="discard pending edits" style="display:none">cancel</button>
+          <button id="run-claude" class="accent" title="open a terminal in this session's cwd and run `clauded --resume`">▶ Run Claude</button>
           <button id="copy-path" class="ghost" title="copy file path">copy path</button>
           <button data-close class="ghost">close</button>
         </div>

@@ -16,6 +16,14 @@ const state = {
   lastQueryKey: "",
 };
 
+const editor = {
+  on: false,
+  pending: new Map(), // key `${msg_uuid}:${block_index}` -> {action, ...}
+  backupsByBlock: new Map(), // key -> [rows]
+  selectedKey: null,
+  currentSession: null, // {pk, messages, ...}
+};
+
 const searchCache = new Map(); // queryKey -> {ts, data}
 const CACHE_TTL = 30_000;
 
@@ -283,6 +291,20 @@ function renderProjects() {
   $("#proj-count").textContent = `${items.length}/${state.projects.length}`;
   for (const p of items) {
     const active = state.projectIds.has(p.id);
+    const browseBtn = el("button", {
+      class: "proj-browse",
+      title: "browse only this project (clears chips)",
+      onclick: (e) => {
+        e.stopPropagation();
+        state.chips = [];
+        state.fromDate = state.toDate = "";
+        state.projectIds = new Set([p.id]);
+        renderChips();
+        renderProjects();
+        triggerSearch();
+        saveState();
+      },
+    }, "›");
     box.append(el("div", {
       class: "proj-item" + (active ? " active" : ""),
       onclick: () => {
@@ -294,7 +316,10 @@ function renderProjects() {
       },
       title: p.cwd || p.folder,
     },
-      el("div", { class: "proj-name" }, prettyFolder(p)),
+      el("div", { class: "proj-row" },
+        el("div", { class: "proj-name" }, prettyFolder(p)),
+        browseBtn,
+      ),
       el("div", { class: "proj-meta" },
         el("span", {}, `${p.session_count} sess`),
         el("span", {}, `${p.message_count} msg`),
@@ -320,18 +345,32 @@ function prettyFolder(p) {
 async function openViewer(r, restoreScroll) {
   const v = $("#viewer");
   v.classList.remove("hidden");
+  // exiting any existing edit mode when opening a fresh viewer
+  exitEditMode();
   const pk = r.session_pk || r.id;
   window._viewerPk = pk;
   $("#viewer-title").innerHTML = `<div class="v-folder">${escapeHtml(r.project_folder)}</div><div class="v-file">${escapeHtml(r.file_path || r.session_id || "")}</div>`;
   $("#viewer-body").innerHTML = `<div class="empty"><span class="spinner"></span>loading…</div>`;
   saveState();
 
-  const res = await fetch(`/api/session/${pk}?limit=1500`);
+  const [res, backupsRes] = await Promise.all([
+    fetch(`/api/session/${pk}?limit=1500`),
+    fetch(`/api/session/${pk}/backups`),
+  ]);
   if (!res.ok) {
     $("#viewer-body").innerHTML = `<div class="empty">failed to load (${res.status})</div>`;
     return;
   }
   const data = await res.json();
+  const backupsData = backupsRes.ok ? await backupsRes.json() : { block_backups: [] };
+  editor.backupsByBlock.clear();
+  for (const b of backupsData.block_backups || []) {
+    if (b.deleted) continue;
+    const k = `${b.msg_uuid}:${b.block_index}`;
+    if (!editor.backupsByBlock.has(k)) editor.backupsByBlock.set(k, []);
+    editor.backupsByBlock.get(k).push(b);
+  }
+  editor.currentSession = { pk, data };
   const includeTerms = state.chips.filter((c) => c.mode === "include").map((c) => c.term);
   renderViewer(data, includeTerms, r);
 
@@ -390,7 +429,7 @@ function renderViewer(data, terms, summary) {
       el("span", { class: "msg-role" }, m.role),
       el("span", {}, fmtDate(m.timestamp)),
     );
-    const blocks = renderBlocks(m.content, terms);
+    const blocks = renderBlocks(m, terms);
     body.append(el("div", { class: "msg " + m.role }, head, blocks));
   }
   if (data.has_more) {
@@ -398,45 +437,270 @@ function renderViewer(data, terms, summary) {
   }
 }
 
-function renderBlocks(content, terms) {
+function renderBlocks(msg, terms) {
   const out = document.createDocumentFragment();
+  const content = msg.content;
+  const msgUuid = msg.uuid || `idx-${msg.idx}`;
   if (content == null) return out;
+
+  function wrapBlock(idx, blockType, ...children) {
+    const wrap = el("div", {
+      class: "block-wrap",
+      "data-msg-uuid": msgUuid,
+      "data-block-index": String(idx),
+      "data-block-type": blockType,
+    }, ...children);
+    // pending indicator + actions
+    decorateBlock(wrap, msgUuid, idx, blockType);
+    return wrap;
+  }
+
   if (typeof content === "string") {
-    out.append(el("div", { class: "msg-content", html: highlightHtml(content, terms) }));
+    out.append(wrapBlock(0, "string",
+      el("div", { class: "msg-content", html: highlightHtml(content, terms) }),
+    ));
     return out;
   }
   if (!Array.isArray(content)) {
-    out.append(el("div", { class: "msg-content", html: highlightHtml(JSON.stringify(content, null, 2), terms) }));
+    out.append(wrapBlock(0, "json",
+      el("div", { class: "msg-content", html: highlightHtml(JSON.stringify(content, null, 2), terms) }),
+    ));
     return out;
   }
-  for (const b of content) {
+  for (let i = 0; i < content.length; i++) {
+    const b = content[i];
     if (!b || typeof b !== "object") continue;
+    const children = [];
+    let blockType = b.type || "unknown";
     if (b.type === "text") {
-      out.append(el("div", { class: "msg-content", html: highlightHtml(b.text || "", terms) }));
+      children.push(el("div", { class: "msg-content", html: highlightHtml(b.text || "", terms) }));
     } else if (b.type === "thinking") {
-      out.append(el("div", { class: "block-meta" }, "thinking"));
-      out.append(el("div", { class: "msg-content", html: highlightHtml(b.thinking || "", terms) }));
+      children.push(el("div", { class: "block-meta" }, "thinking"));
+      children.push(el("div", { class: "msg-content", html: highlightHtml(b.thinking || "", terms) }));
     } else if (b.type === "tool_use") {
       const inputStr = JSON.stringify(b.input ?? {}, null, 2);
-      out.append(el("div", { class: "block-meta" }, `tool_use · ${b.name || ""}`));
-      out.append(el("div", { class: "tool-use", html: highlightHtml(inputStr, terms) }));
+      children.push(el("div", { class: "block-meta" }, `tool_use · ${b.name || ""}${b.id ? "  (" + b.id + ")" : ""}`));
+      children.push(el("div", { class: "tool-use", html: highlightHtml(inputStr, terms) }));
     } else if (b.type === "tool_result") {
-      out.append(el("div", { class: "block-meta" }, "tool_result"));
       const txt = typeof b.content === "string"
         ? b.content
         : Array.isArray(b.content)
           ? b.content.map((c) => (typeof c === "string" ? c : (c.text || JSON.stringify(c)))).join("\n")
           : JSON.stringify(b.content || "");
-      out.append(el("div", { class: "tool-result", html: highlightHtml(txt, terms) }));
+      children.push(el("div", { class: "block-meta" }, `tool_result${b.tool_use_id ? " ↳ " + b.tool_use_id : ""}`));
+      children.push(el("div", { class: "tool-result", html: highlightHtml(txt, terms) }));
     } else if (b.type === "image") {
-      out.append(el("div", { class: "block-meta" }, "[image]"));
+      children.push(el("div", { class: "block-meta" }, "[image]"));
     } else if (b.text) {
-      out.append(el("div", { class: "msg-content", html: highlightHtml(b.text, terms) }));
+      children.push(el("div", { class: "msg-content", html: highlightHtml(b.text, terms) }));
     } else {
-      out.append(el("div", { class: "block-meta" }, b.type || "(unknown)"));
+      children.push(el("div", { class: "block-meta" }, b.type || "(unknown)"));
     }
+    out.append(wrapBlock(i, blockType, ...children));
   }
   return out;
+}
+
+function decorateBlock(wrap, msgUuid, idx, blockType) {
+  const key = `${msgUuid}:${idx}`;
+  // Backup badge
+  const backups = editor.backupsByBlock.get(key);
+  if (backups?.length) {
+    wrap.append(el("span", {
+      class: "block-backup-badge",
+      title: `${backups.length} backup(s) — click to view`,
+      onclick: (e) => { e.stopPropagation(); openBackupsForBlock(key, backups); },
+    }, `${backups.length} bak`));
+  }
+  // Pending indicator
+  const pending = editor.pending.get(key);
+  if (pending) {
+    wrap.classList.add("pending");
+    if (pending.action === "blank") wrap.classList.add("pending-blank");
+    if (pending.action === "delete") wrap.classList.add("pending-delete");
+  }
+  // Click → select in edit mode
+  wrap.addEventListener("click", (e) => {
+    if (!editor.on) return;
+    e.stopPropagation();
+    selectBlock(wrap, msgUuid, idx, blockType);
+  });
+}
+
+function selectBlock(wrap, msgUuid, idx, blockType) {
+  // Clear previous selection
+  $$(".block-wrap.selected").forEach((w) => {
+    w.classList.remove("selected");
+    const a = w.querySelector(".block-actions");
+    if (a) a.remove();
+  });
+  wrap.classList.add("selected");
+  editor.selectedKey = `${msgUuid}:${idx}`;
+
+  // Build action toolbar
+  const isTextLike = blockType === "text" || blockType === "thinking" || blockType === "tool_result" || blockType === "string";
+  const actions = el("div", { class: "block-actions" });
+  actions.append(el("button", {
+    onclick: (e) => { e.stopPropagation(); markPending(msgUuid, idx, blockType, { action: "blank" }); },
+  }, "blank"));
+  if (isTextLike) {
+    actions.append(el("button", {
+      onclick: (e) => { e.stopPropagation(); openInlineEditor(wrap, msgUuid, idx, blockType); },
+    }, "edit"));
+    // external slider
+    const headInput = el("input", { type: "range", min: "0", max: "2000", value: "300", step: "50" });
+    const tailInput = el("input", { type: "range", min: "0", max: "2000", value: "300", step: "50" });
+    const headLabel = el("span", {}, "300");
+    const tailLabel = el("span", {}, "300");
+    headInput.addEventListener("input", () => { headLabel.textContent = headInput.value; });
+    tailInput.addEventListener("input", () => { tailLabel.textContent = tailInput.value; });
+    actions.append(el("span", { class: "ext-slider" },
+      "external head:", headInput, headLabel, " tail:", tailInput, tailLabel,
+      el("button", {
+        onclick: (e) => {
+          e.stopPropagation();
+          markPending(msgUuid, idx, blockType, {
+            action: "external",
+            summary_head: parseInt(headInput.value, 10),
+            summary_tail: parseInt(tailInput.value, 10),
+          });
+        },
+      }, "→ external"),
+    ));
+  }
+  actions.append(el("button", {
+    class: "danger",
+    onclick: (e) => { e.stopPropagation(); markPending(msgUuid, idx, blockType, { action: "delete" }); },
+  }, "delete block"));
+  if (editor.pending.has(`${msgUuid}:${idx}`)) {
+    actions.append(el("button", {
+      onclick: (e) => { e.stopPropagation(); unmarkPending(msgUuid, idx); },
+    }, "undo"));
+  }
+  wrap.append(actions);
+}
+
+function openInlineEditor(wrap, msgUuid, idx, blockType) {
+  // Get current text from rendered DOM (or original)
+  const contentEl = wrap.querySelector(".msg-content, .tool-result, .tool-use");
+  const initial = contentEl ? contentEl.textContent : "";
+  const ta = el("textarea", {}, initial);
+  const editArea = el("div", { class: "block-edit-area" }, ta);
+  const apply = el("button", {
+    onclick: (e) => {
+      e.stopPropagation();
+      markPending(msgUuid, idx, blockType, { action: "edit", new_text: ta.value });
+      editArea.remove();
+    },
+  }, "apply edit");
+  const cancel = el("button", { class: "ghost", onclick: (e) => { e.stopPropagation(); editArea.remove(); } }, "cancel");
+  editArea.append(el("div", { style: "margin-top:6px; display:flex; gap:6px;" }, apply, cancel));
+  wrap.append(editArea);
+  ta.focus();
+}
+
+function markPending(msgUuid, idx, blockType, change) {
+  const key = `${msgUuid}:${idx}`;
+  editor.pending.set(key, { ...change, msg_uuid: msgUuid, index: idx, block_type: blockType });
+  refreshSaveBar();
+  // Update visual on the wrap
+  const wrap = document.querySelector(`.block-wrap[data-msg-uuid="${cssEsc(msgUuid)}"][data-block-index="${idx}"]`);
+  if (wrap) {
+    wrap.classList.remove("pending-blank", "pending-delete");
+    wrap.classList.add("pending");
+    if (change.action === "blank") wrap.classList.add("pending-blank");
+    if (change.action === "delete") wrap.classList.add("pending-delete");
+  }
+}
+
+function unmarkPending(msgUuid, idx) {
+  const key = `${msgUuid}:${idx}`;
+  editor.pending.delete(key);
+  refreshSaveBar();
+  const wrap = document.querySelector(`.block-wrap[data-msg-uuid="${cssEsc(msgUuid)}"][data-block-index="${idx}"]`);
+  if (wrap) {
+    wrap.classList.remove("pending", "pending-blank", "pending-delete");
+  }
+}
+
+function cssEsc(s) { return CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/"/g, '\\"'); }
+
+function refreshSaveBar() {
+  const has = editor.pending.size > 0;
+  $("#save-edits").textContent = has ? `save (${editor.pending.size})` : "save";
+  $("#save-edits").disabled = !has;
+}
+
+async function openBackupsForBlock(key, backups) {
+  // Lightweight modal — just an alert-ish overlay for now.
+  const info = backups.map((b) => `[${b.action}] ${b.created_at} (${b.bytes}B) → ${b.file_path}`).join("\n\n");
+  alert(`Backups for block ${key}:\n\n${info}`);
+}
+
+function enterEditMode() {
+  if (editor.on) return;
+  editor.on = true;
+  $("#viewer").classList.add("edit-mode");
+  $("#edit-toggle").textContent = "✎ editing";
+  $("#save-edits").style.display = "";
+  $("#cancel-edits").style.display = "";
+  refreshSaveBar();
+}
+
+function exitEditMode() {
+  if (!editor.on && editor.pending.size === 0) return;
+  editor.on = false;
+  editor.pending.clear();
+  editor.selectedKey = null;
+  $("#viewer").classList.remove("edit-mode");
+  $("#edit-toggle").textContent = "✎ edit";
+  $("#save-edits").style.display = "none";
+  $("#cancel-edits").style.display = "none";
+}
+
+async function commitEdits() {
+  const pk = editor.currentSession?.pk;
+  if (!pk) return;
+  if (!editor.pending.size) { exitEditMode(); return; }
+
+  // Group by msg_uuid
+  const byUuid = new Map();
+  for (const v of editor.pending.values()) {
+    if (!byUuid.has(v.msg_uuid)) byUuid.set(v.msg_uuid, []);
+    byUuid.get(v.msg_uuid).push({
+      index: v.index,
+      action: v.action,
+      new_text: v.new_text,
+      summary_head: v.summary_head,
+      summary_tail: v.summary_tail,
+    });
+  }
+  const changes = [...byUuid.entries()].map(([msg_uuid, blocks]) => ({ msg_uuid, blocks }));
+
+  const saveBtn = $("#save-edits");
+  const orig = saveBtn.textContent;
+  saveBtn.disabled = true;
+  saveBtn.textContent = "saving…";
+  try {
+    const r = await fetch(`/api/session/${pk}/save`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ changes }),
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      saveBtn.textContent = "✗ " + (j.error || "failed");
+      setTimeout(() => { saveBtn.textContent = orig; saveBtn.disabled = false; }, 3000);
+      return;
+    }
+    // Success: reload viewer for fresh state, clear pending
+    const r2 = { session_pk: pk, project_folder: "", file_path: "" };
+    exitEditMode();
+    await openViewer(r2);
+  } catch (e) {
+    saveBtn.textContent = "✗ " + e.message;
+    setTimeout(() => { saveBtn.textContent = orig; saveBtn.disabled = false; }, 3000);
+  }
 }
 
 /* ----------------- stats ----------------- */
@@ -538,6 +802,49 @@ function attachHandlers() {
     const fileEl = $("#viewer-title .v-file");
     if (fileEl) {
       try { await navigator.clipboard.writeText(fileEl.textContent); } catch {}
+    }
+  });
+
+  $("#edit-toggle").addEventListener("click", () => {
+    if (editor.on) exitEditMode(); else enterEditMode();
+  });
+  $("#save-edits").addEventListener("click", commitEdits);
+  $("#cancel-edits").addEventListener("click", () => {
+    // Clear pending, re-render to drop visuals
+    editor.pending.clear();
+    refreshSaveBar();
+    exitEditMode();
+    // Re-render current session to drop pending styling
+    if (editor.currentSession) {
+      const terms = state.chips.filter((c) => c.mode === "include").map((c) => c.term);
+      renderViewer(editor.currentSession.data, terms, null);
+    }
+  });
+
+  $("#run-claude").addEventListener("click", async () => {
+    const pk = window._viewerPk;
+    if (!pk) return;
+    const btn = $("#run-claude");
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "launching…";
+    try {
+      const r = await fetch("/api/run-claude", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_pk: pk }),
+      });
+      const j = await r.json();
+      if (!r.ok) {
+        btn.textContent = "✗ " + (j.error || "failed");
+        setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2500);
+        return;
+      }
+      btn.textContent = "✓ launched";
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1800);
+    } catch (e) {
+      btn.textContent = "✗ " + e.message;
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2500);
     }
   });
 }

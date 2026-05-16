@@ -82,6 +82,37 @@ function initSchema(db) {
       key TEXT PRIMARY KEY,
       value TEXT
     );
+
+    /* Per-block content backups. Created when a block is blanked, edited, sent to
+       external, or deleted. The actual content lives at file_path on disk; rows
+       can be soft-deleted (deleted=1) without removing the file. */
+    CREATE TABLE IF NOT EXISTS block_backups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_pk INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+      msg_uuid TEXT NOT NULL,
+      block_index INTEGER NOT NULL,
+      content_hash TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      action TEXT,
+      block_type TEXT,
+      bytes INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      deleted INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_block_backups_loc
+      ON block_backups(session_pk, msg_uuid, block_index);
+
+    /* Whole-file backups taken before a save operation. */
+    CREATE TABLE IF NOT EXISTS file_backups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_pk INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+      file_path TEXT NOT NULL,
+      backup_path TEXT NOT NULL,
+      bytes INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      note TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_file_backups_session ON file_backups(session_pk);
   `);
 }
 
