@@ -691,30 +691,83 @@ function buildApp(db) {
     });
   });
 
+  /* Reconstruct a real path from the encoded project folder name.
+     `.claude/projects` uses `C--dev-AI-forms` for `C:\dev\AI\forms`. */
+  function reconstructPathFromFolder(folder) {
+    if (!folder || !/^[A-Za-z]--/.test(folder)) return null;
+    return folder[0] + ":\\" + folder.slice(3).replaceAll("-", "\\");
+  }
+
+  /* Resolve the project working folder for a session: try the session's own cwd,
+     then the project's cwd, then reconstruct from the folder name. Returns the
+     first one that exists on disk (or the best guess if none exist). */
+  function resolveProjectCwd(sessionPk) {
+    const row = db
+      .prepare(
+        `SELECT s.session_id, s.cwd AS s_cwd, p.cwd AS p_cwd, p.folder AS folder
+         FROM sessions s JOIN projects p ON p.id = s.project_id
+         WHERE s.id = ?`
+      )
+      .get(sessionPk);
+    if (!row) return null;
+    const reconstructed = reconstructPathFromFolder(row.folder);
+    const candidates = [row.s_cwd, row.p_cwd, reconstructed].filter(Boolean);
+    let resolved = null;
+    for (const c of candidates) {
+      try { if (fs.existsSync(c)) { resolved = c; break; } } catch {}
+    }
+    return {
+      session_id: row.session_id,
+      session_cwd: row.s_cwd || null,
+      project_cwd: row.p_cwd || null,
+      reconstructed,
+      resolved: resolved || row.s_cwd || row.p_cwd || reconstructed || null,
+      exists: !!resolved,
+    };
+  }
+
+  app.get("/api/session/:pk/path", (req, res) => {
+    const pk = parseInt(req.params.pk, 10);
+    const info = resolveProjectCwd(pk);
+    if (!info) return res.status(404).json({ error: "session not found" });
+    res.json(info);
+  });
+
   /* ---- Run Claude in a new terminal window pointed at a session's cwd ---- */
   app.post("/api/run-claude", (req, res) => {
     const sessionPk = parseInt(req.body?.session_pk || "0", 10);
     if (!sessionPk) return res.status(400).json({ error: "session_pk required" });
 
-    const sess = db.prepare("SELECT session_id, cwd FROM sessions WHERE id = ?").get(sessionPk);
-    if (!sess) return res.status(404).json({ error: "session not found" });
+    const info = resolveProjectCwd(sessionPk);
+    if (!info) return res.status(404).json({ error: "session not found" });
 
-    const sessionId = String(sess.session_id || "");
-    const cwd = String(sess.cwd || "");
+    const sessionId = String(info.session_id || "");
+    const cwd = info.resolved;
     if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
       return res.status(400).json({ error: "session_id invalid (refusing to spawn)" });
     }
-    if (!cwd || !fs.existsSync(cwd)) {
-      return res.status(400).json({ error: "cwd missing or not on disk", cwd });
+    if (!cwd) {
+      return res.status(400).json({
+        error: "no usable cwd for this session (tried session.cwd, project.cwd, folder reconstruction)",
+        tried: info,
+      });
+    }
+    if (!info.exists) {
+      return res.status(400).json({
+        error: `cwd not found on disk: ${cwd}`,
+        tried: info,
+      });
     }
 
-    // Build:  start "" cmd /k cd /d "<cwd>" ^&^& clauded --resume <hash>
-    // Using start with an empty title so the new window detaches cleanly.
-    const cmdLine =
-      `start "" cmd /k cd /d "${cwd.replace(/"/g, '""')}" ^&^& clauded --resume ${sessionId}`;
+    // Use `start "" /D <cwd>` to launch a new cmd window already chdir'd to the
+    // project folder, then run `clauded --resume <hash>` there. This avoids the
+    // && parsing problem (where && would otherwise run in the launching shell).
+    const cwdEsc = cwd.replace(/"/g, '""');
+    const cmdLine = `start "" /D "${cwdEsc}" cmd /k clauded --resume ${sessionId}`;
 
     try {
-      const child = spawn("cmd.exe", ["/c", cmdLine], {
+      const child = spawn(cmdLine, [], {
+        shell: true,
         detached: true,
         stdio: "ignore",
         windowsHide: false,

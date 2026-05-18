@@ -799,9 +799,25 @@ function attachHandlers() {
   });
 
   $("#copy-path").addEventListener("click", async () => {
-    const fileEl = $("#viewer-title .v-file");
-    if (fileEl) {
-      try { await navigator.clipboard.writeText(fileEl.textContent); } catch {}
+    const pk = window._viewerPk;
+    if (!pk) return;
+    const btn = $("#copy-path");
+    const orig = btn.textContent;
+    try {
+      const r = await fetch(`/api/session/${pk}/path`);
+      const j = await r.json();
+      const cwd = j.resolved || j.session_cwd || j.project_cwd || "";
+      if (!cwd) {
+        btn.textContent = "✗ no cwd";
+        setTimeout(() => (btn.textContent = orig), 2000);
+        return;
+      }
+      await navigator.clipboard.writeText(cwd);
+      btn.textContent = j.exists ? "✓ copied" : "✓ copied (missing on disk)";
+      setTimeout(() => (btn.textContent = orig), 1800);
+    } catch (e) {
+      btn.textContent = "✗ " + e.message;
+      setTimeout(() => (btn.textContent = orig), 2500);
     }
   });
 
@@ -836,11 +852,19 @@ function attachHandlers() {
       });
       const j = await r.json();
       if (!r.ok) {
-        btn.textContent = "✗ " + (j.error || "failed");
-        setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2500);
+        btn.textContent = "✗ failed";
+        btn.title = j.error || "failed";
+        console.error("[run-claude]", j);
+        // Surface the full error to the user — too easy to miss in a button label
+        const detail = j.tried
+          ? `${j.error}\n\nTried:\n  session.cwd: ${j.tried.session_cwd}\n  project.cwd: ${j.tried.project_cwd}\n  reconstructed: ${j.tried.reconstructed}`
+          : (j.error || "failed");
+        alert("Run Claude:\n\n" + detail);
+        setTimeout(() => { btn.textContent = orig; btn.title = ""; btn.disabled = false; }, 2500);
         return;
       }
       btn.textContent = "✓ launched";
+      btn.title = `cd ${j.cwd} && ${j.cmd}`;
       setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1800);
     } catch (e) {
       btn.textContent = "✗ " + e.message;
