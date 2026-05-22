@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 "use strict";
 
+// MCP mode: serve over stdio so other Claude sessions can search the index.
+// Must run BEFORE we load the express server (no need for it, and stdin/stdout
+// have to stay clean for JSON-RPC).
+if (process.argv.includes("--mcp")) {
+  require("./ccs-mcp.js");
+  return;
+}
+
 const fs = require("fs");
 const os = require("os");
 const path = require("path");

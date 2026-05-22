@@ -23,7 +23,9 @@
   "pkg": {
     "scripts": [
       "server.js",
-      "indexer.js"
+      "indexer.js",
+      "lib/search.js",
+      "bin/ccs-mcp.js"
     ],
     "assets": [
       "public/**/*",
