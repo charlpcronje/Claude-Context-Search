@@ -499,6 +499,166 @@ function buildApp(db) {
     res.json({ ok: true, soft_deleted: r.changes });
   });
 
+  /* ---- Restore: bring back the original JSONL from the oldest file backup ---- */
+  /* This is the emergency "undo everything" path — used when edits broke the
+     session (e.g. API rejects empty text blocks). It:
+       1. Finds the OLDEST file_backups row (= state before the first edit)
+       2. Takes a fresh safety backup of the CURRENT (broken) state
+       3. Copies the original over the current file
+       4. Marks the session for re-index so FTS catches up                          */
+  app.post("/api/session/:pk/restore-original", (req, res) => {
+    const pk = parseInt(req.params.pk, 10);
+    const sess = db.prepare("SELECT id, session_id, file_path FROM sessions WHERE id = ?").get(pk);
+    if (!sess) return res.status(404).json({ error: "session not found" });
+    if (!fs.existsSync(sess.file_path)) return res.status(410).json({ error: "session file missing" });
+
+    const oldest = db
+      .prepare(
+        `SELECT id, backup_path, created_at, bytes FROM file_backups
+         WHERE session_pk = ? AND note IS NOT 'auto: pre-restore safety'
+         ORDER BY created_at ASC LIMIT 1`
+      )
+      .get(pk);
+    if (!oldest) return res.status(404).json({ error: "no file backups recorded for this session" });
+    if (!fs.existsSync(oldest.backup_path)) {
+      return res.status(500).json({ error: "oldest backup missing on disk", backup_path: oldest.backup_path });
+    }
+
+    // Safety backup of the current (broken) state — keeps an escape hatch
+    ensureDir(fileBackupDir(sess.session_id));
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safety = path.join(fileBackupDir(sess.session_id), `${stamp}-pre-restore.jsonl`);
+    try { fs.copyFileSync(sess.file_path, safety); } catch (e) {
+      return res.status(500).json({ error: "safety backup failed: " + e.message });
+    }
+    const safetyStat = fs.statSync(safety);
+    db.prepare(
+      `INSERT INTO file_backups (session_pk, file_path, backup_path, bytes, created_at, note)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(pk, sess.file_path, safety, safetyStat.size, new Date().toISOString(), "auto: pre-restore safety");
+
+    // Restore
+    try { fs.copyFileSync(oldest.backup_path, sess.file_path); } catch (e) {
+      return res.status(500).json({ error: "restore copy failed: " + e.message });
+    }
+    db.prepare("UPDATE sessions SET file_mtime = 0 WHERE id = ?").run(pk);
+
+    res.json({
+      ok: true,
+      restored_from: oldest.backup_path,
+      restored_from_created: oldest.created_at,
+      restored_bytes: oldest.bytes,
+      safety_backup: safety,
+    });
+  });
+
+  /* List file-level backups for a session, newest first. */
+  app.get("/api/session/:pk/file-backups", (req, res) => {
+    const pk = parseInt(req.params.pk, 10);
+    const rows = db
+      .prepare(
+        `SELECT id, backup_path, bytes, created_at, note FROM file_backups
+         WHERE session_pk = ? ORDER BY created_at DESC`
+      )
+      .all(pk);
+    res.json({ backups: rows });
+  });
+
+  /* Restore from a specific file backup (lets the user pick a known-good revision). */
+  app.post("/api/session/:pk/restore-file-backup", (req, res) => {
+    const pk = parseInt(req.params.pk, 10);
+    const backupId = parseInt(req.body?.backup_id || "0", 10);
+    if (!backupId) return res.status(400).json({ error: "backup_id required" });
+    const sess = db.prepare("SELECT id, session_id, file_path FROM sessions WHERE id = ?").get(pk);
+    if (!sess) return res.status(404).json({ error: "session not found" });
+    const bk = db.prepare("SELECT * FROM file_backups WHERE id = ? AND session_pk = ?").get(backupId, pk);
+    if (!bk) return res.status(404).json({ error: "backup not found for this session" });
+    if (!fs.existsSync(bk.backup_path)) return res.status(500).json({ error: "backup file missing", path: bk.backup_path });
+
+    ensureDir(fileBackupDir(sess.session_id));
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safety = path.join(fileBackupDir(sess.session_id), `${stamp}-pre-restore.jsonl`);
+    try { fs.copyFileSync(sess.file_path, safety); } catch (e) {
+      return res.status(500).json({ error: "safety backup failed: " + e.message });
+    }
+    const safetyStat = fs.statSync(safety);
+    db.prepare(
+      `INSERT INTO file_backups (session_pk, file_path, backup_path, bytes, created_at, note)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(pk, sess.file_path, safety, safetyStat.size, new Date().toISOString(), `auto: pre-restore (backup ${backupId})`);
+
+    try { fs.copyFileSync(bk.backup_path, sess.file_path); } catch (e) {
+      return res.status(500).json({ error: "restore copy failed: " + e.message });
+    }
+    db.prepare("UPDATE sessions SET file_mtime = 0 WHERE id = ?").run(pk);
+    res.json({ ok: true, restored_from: bk.backup_path, safety_backup: safety });
+  });
+
+  /* Restore a SINGLE block from a per-block backup. Always takes a file-level
+     safety backup first so it can be undone via /restore-original.            */
+  app.post("/api/backup/:id/restore", (req, res) => {
+    const backupId = parseInt(req.params.id, 10);
+    const b = db.prepare("SELECT * FROM block_backups WHERE id = ?").get(backupId);
+    if (!b) return res.status(404).json({ error: "backup not found" });
+    if (!fs.existsSync(b.file_path)) return res.status(500).json({ error: "backup file missing on disk", file_path: b.file_path });
+    const sess = db.prepare("SELECT * FROM sessions WHERE id = ?").get(b.session_pk);
+    if (!sess) return res.status(404).json({ error: "session not found" });
+    if (!fs.existsSync(sess.file_path)) return res.status(410).json({ error: "session file missing" });
+
+    // Read backup and strip the metadata header we wrote at save time.
+    let backupText = fs.readFileSync(b.file_path, "utf8");
+    backupText = backupText.replace(/^<!--[\s\S]*?-->\s*\n?/, "");
+
+    // File-level safety backup before mutating
+    ensureDir(fileBackupDir(sess.session_id));
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safety = path.join(fileBackupDir(sess.session_id), `${stamp}-pre-block-restore.jsonl`);
+    fs.copyFileSync(sess.file_path, safety);
+    const safetyStat = fs.statSync(safety);
+    db.prepare(
+      `INSERT INTO file_backups (session_pk, file_path, backup_path, bytes, created_at, note)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(b.session_pk, sess.file_path, safety, safetyStat.size, new Date().toISOString(), `auto: pre block restore ${backupId}`);
+
+    // Find the message, restore the block in place
+    const lines = fs.readFileSync(sess.file_path, "utf8").split(/\r?\n/);
+    let found = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i]) continue;
+      let obj; try { obj = JSON.parse(lines[i]); } catch { continue; }
+      if (obj.uuid !== b.msg_uuid || !obj.message) continue;
+      const content = obj.message.content;
+      if (typeof content === "string") {
+        if (b.block_index !== 0) continue;
+        obj.message.content = backupText;
+      } else if (Array.isArray(content)) {
+        const cur = content[b.block_index];
+        if (cur == null) continue;
+        if (cur.type === "text") cur.text = backupText;
+        else if (cur.type === "thinking") cur.thinking = backupText;
+        else if (cur.type === "tool_result") cur.content = backupText;
+        else if (cur.type === "tool_use") {
+          // For tool_use the saved text was JSON of the block; parse and restore .input
+          try { const parsed = JSON.parse(backupText); cur.input = parsed.input ?? {}; }
+          catch { cur.input = { _raw: backupText }; }
+        } else {
+          // unknown — best effort: keep the block, attach text
+          cur._restored_text = backupText;
+        }
+      }
+      lines[i] = JSON.stringify(obj);
+      found = true;
+      break;
+    }
+    if (!found) return res.status(404).json({ error: "message uuid not found in current file" });
+
+    const tmp = sess.file_path + ".tmp_restore";
+    fs.writeFileSync(tmp, lines.join("\n"), "utf8");
+    fs.renameSync(tmp, sess.file_path);
+    db.prepare("UPDATE sessions SET file_mtime = 0 WHERE id = ?").run(b.session_pk);
+    res.json({ ok: true, restored_chars: backupText.length, safety_backup: safety });
+  });
+
   /* ---- Save: apply changes to a session, with per-block + file-level backups ---- */
 
   app.post("/api/session/:pk/save", async (req, res) => {

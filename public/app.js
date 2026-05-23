@@ -362,13 +362,20 @@ async function openViewer(r, restoreScroll) {
     return;
   }
   const data = await res.json();
-  const backupsData = backupsRes.ok ? await backupsRes.json() : { block_backups: [] };
+  const backupsData = backupsRes.ok ? await backupsRes.json() : { block_backups: [], file_backups: [] };
   editor.backupsByBlock.clear();
   for (const b of backupsData.block_backups || []) {
     if (b.deleted) continue;
     const k = `${b.msg_uuid}:${b.block_index}`;
     if (!editor.backupsByBlock.has(k)) editor.backupsByBlock.set(k, []);
     editor.backupsByBlock.get(k).push(b);
+  }
+  // Show Restore Original button only if this session has any file backups
+  const hasFileBackups = (backupsData.file_backups || []).length > 0;
+  $("#restore-original").style.display = hasFileBackups ? "" : "none";
+  if (hasFileBackups) {
+    $("#restore-original").title =
+      `${backupsData.file_backups.length} snapshot(s) available. Click to revert to the earliest, or right-click to pick one.`;
   }
   editor.currentSession = { pk, data };
   const includeTerms = state.chips.filter((c) => c.mode === "include").map((c) => c.term);
@@ -632,9 +639,169 @@ function refreshSaveBar() {
 }
 
 async function openBackupsForBlock(key, backups) {
-  // Lightweight modal — just an alert-ish overlay for now.
-  const info = backups.map((b) => `[${b.action}] ${b.created_at} (${b.bytes}B) → ${b.file_path}`).join("\n\n");
-  alert(`Backups for block ${key}:\n\n${info}`);
+  const [msgUuid, blockIndex] = key.split(":");
+  const pk = editor.currentSession?.pk;
+  showBackupModal({
+    title: `Block backups · msg ${msgUuid.slice(0, 8)} · block ${blockIndex}`,
+    subtitle: `${backups.length} backup(s)`,
+    rows: backups,
+    async renderPreview(b) {
+      try {
+        const r = await fetch(`/api/backup/${b.id}/content`);
+        const j = await r.json();
+        return j.content || "";
+      } catch { return "(failed to load)"; }
+    },
+    actions: (b) => [
+      {
+        label: "restore this",
+        kind: "danger",
+        confirm: `Restore this block to its original content?\n(a safety backup of the current file is created first)`,
+        run: async () => {
+          const r = await fetch(`/api/backup/${b.id}/restore`, { method: "POST" });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || "restore failed");
+          return j;
+        },
+      },
+    ],
+  });
+}
+
+/* Generic backup modal — used for both block-level and file-level backups. */
+function showBackupModal(opts) {
+  closeBackupModal();
+  const back = el("div", { class: "bk-modal-back", onclick: (e) => { if (e.target === back) closeBackupModal(); } });
+  const head = el("div", { class: "bk-modal-head" },
+    el("span", {}, opts.title || "Backups"),
+    opts.subtitle ? el("span", { class: "dim" }, opts.subtitle) : null,
+    el("button", { class: "ghost bk-modal-close", onclick: closeBackupModal }, "close"),
+  );
+  const body = el("div", { class: "bk-modal-body" });
+  if (!opts.rows?.length) {
+    body.append(el("div", { class: "bk-empty" }, "no backups yet"));
+  } else {
+    for (const r of opts.rows) {
+      const row = el("div", { class: "bk-row" });
+      const when = r.created_at ? fmtDate(r.created_at) : "";
+      const actionLabel = r.action || r.note || "";
+      const head = el("div", { class: "bk-row-head" },
+        actionLabel ? el("span", { class: `bk-action ${actionLabel}` }, actionLabel) : null,
+        el("span", { class: "bk-when" }, when, " · ", String(r.bytes || 0), " B"),
+      );
+      const actionsRow = el("div", { class: "bk-row-actions" });
+      for (const a of (opts.actions ? opts.actions(r) : [])) {
+        const btn = el("button", {
+          class: a.kind === "danger" ? "danger" : "ghost",
+          onclick: async (e) => {
+            e.stopPropagation();
+            if (a.confirm && !confirm(a.confirm)) return;
+            btn.disabled = true; btn.textContent = "…";
+            try {
+              const res = await a.run();
+              btn.textContent = "✓ done";
+              if (a.onSuccess) await a.onSuccess(res);
+              setTimeout(() => closeBackupModal(), 700);
+            } catch (err) {
+              btn.textContent = "✗ " + err.message;
+              setTimeout(() => { btn.disabled = false; btn.textContent = a.label; }, 2500);
+            }
+          },
+        }, a.label);
+        actionsRow.append(btn);
+      }
+      head.append(actionsRow);
+      row.append(head);
+      if (opts.renderPreview) {
+        const preview = el("div", { class: "bk-preview" }, "loading…");
+        row.append(preview);
+        (async () => { preview.textContent = await opts.renderPreview(r); })();
+      }
+      body.append(row);
+    }
+  }
+  const modal = el("div", { class: "bk-modal" }, head, body);
+  back.append(modal);
+  document.body.append(back);
+  window._bkModal = back;
+  document.addEventListener("keydown", _bkModalEsc);
+}
+function closeBackupModal() {
+  if (window._bkModal) { window._bkModal.remove(); window._bkModal = null; }
+  document.removeEventListener("keydown", _bkModalEsc);
+}
+function _bkModalEsc(e) { if (e.key === "Escape") closeBackupModal(); }
+
+async function showFileBackupsModal(pk) {
+  let backups = [];
+  try {
+    const r = await fetch(`/api/session/${pk}/file-backups`);
+    const j = await r.json();
+    backups = j.backups || [];
+  } catch {}
+  showBackupModal({
+    title: "File backups (whole-session snapshots)",
+    subtitle: `${backups.length} snapshot(s) · newest first`,
+    rows: backups,
+    actions: (b) => [{
+      label: "restore from this",
+      kind: "danger",
+      confirm: `Replace the current session with this snapshot from ${fmtDate(b.created_at)}?\n(a safety backup of the current state is created first)`,
+      run: async () => {
+        const r = await fetch(`/api/session/${pk}/restore-file-backup`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ backup_id: b.id }),
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "restore failed");
+        return j;
+      },
+      onSuccess: async () => {
+        closeBackupModal();
+        await reopenCurrentViewer();
+      },
+    }],
+  });
+}
+
+async function reopenCurrentViewer() {
+  const pk = window._viewerPk;
+  if (!pk) return;
+  await openViewer({ session_pk: pk, project_folder: "", file_path: "" });
+}
+
+async function doRestoreOriginal() {
+  const pk = window._viewerPk;
+  if (!pk) return;
+  if (!confirm(
+    "Restore the ORIGINAL session content?\n\n" +
+    "All edits will be reverted to the state before your first save.\n" +
+    "Your current (broken) state will be saved as a safety backup first."
+  )) return;
+  const btn = $("#restore-original");
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "restoring…";
+  try {
+    const r = await fetch(`/api/session/${pk}/restore-original`, { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) {
+      btn.textContent = "✗ " + (j.error || "failed");
+      alert("Restore failed:\n\n" + (j.error || "unknown"));
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
+      return;
+    }
+    btn.textContent = "✓ restored";
+    setTimeout(async () => {
+      btn.textContent = orig;
+      btn.disabled = false;
+      await reopenCurrentViewer();
+    }, 800);
+  } catch (e) {
+    btn.textContent = "✗ " + e.message;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
+  }
 }
 
 function enterEditMode() {
@@ -819,6 +986,13 @@ function attachHandlers() {
       btn.textContent = "✗ " + e.message;
       setTimeout(() => (btn.textContent = orig), 2500);
     }
+  });
+
+  $("#restore-original").addEventListener("click", doRestoreOriginal);
+  $("#restore-original").addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    const pk = window._viewerPk;
+    if (pk) showFileBackupsModal(pk);
   });
 
   $("#edit-toggle").addEventListener("click", () => {
