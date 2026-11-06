@@ -1,3 +1,88 @@
+﻿# ==== Managed by _gh_backup tool â€” vendor/build + large-media exclusions ====
+
+# ---- Rust ----
+target/
+**/target/
+Cargo.lock.orig
+
+# ---- Node / JS / TS ----
+node_modules/
+**/node_modules/
+bower_components/
+.pnp/
+.yarn/
+dist/
+build/
+.next/
+.nuxt/
+.cache/
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
+
+# ---- Python ----
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---- PHP / Composer ----
+vendor/
+**/vendor/
+composer.phar
+
+# ---- Java / Gradle / Maven ----
+.gradle/
+*.class
+
+# ---- Agent / editor scratch ----
+.claude/worktrees/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ==== Large data / model / media (excluded per instruction â€” kept on disk, not in git) ====
+.certdb/
+**/.certdb/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.rtc
+*.ssvd
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.emb
+*.gguf
+*.onnx
+*.h5
+*.hdf5
+enwik8
+enwik9
+enwik8.*
+enwik9.*
+*.pack
+
+# ==== Auto-added: individual files >= 95 MB (kept on disk, excluded from git) ====
+
+# --- oversized individual files ---
+/data/index.db
+
+# ==== pre-existing ====
 # dependencies
 node_modules/
 
@@ -27,3 +112,4 @@ Thumbs.db
 # temp
 tmp/
 *.tmp
+
